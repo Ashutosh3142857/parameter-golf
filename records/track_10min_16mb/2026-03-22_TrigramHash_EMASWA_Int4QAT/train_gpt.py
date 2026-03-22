@@ -1,49 +1,3 @@
-"""
-Submission: TrigramHash + EMA-SWA + Int4 QAT MLP
-Author: Ashutosh (Ashutosh3142857)
-
-Key innovations over the SOTA (1.1428 BPB, 2026-03-20_10L_Int5MLP_MuonWD04_SWA50):
-
-  1. TrigramHash(2048, dim=48):
-       Extends BigramHash to capture 3-token context windows. Trigrams expose
-       richer n-gram statistics that bigrams miss (e.g., "New York City" vs
-       "New York" + "York City"). Small table (2048 buckets) and dim (48) keep
-       the byte cost well under 100 KB after int8+zstd compression.
-
-  2. EMA-SWA (Exponential Moving Average Stochastic Weight Averaging):
-       Replace uniform checkpoint averaging with exponential weighting so that
-       more-converged late-warmdown checkpoints count more. Formula:
-           W_ema = alpha * W_ema + (1 - alpha) * W_step     (alpha=0.9)
-       This yields a smoother final model than flat averaging and costs no
-       additional artifact bytes.
-
-  3. Int4 QAT for MLP weights:
-       Starting at SWA_START_FRAC of warmdown, apply Straight-Through Estimator
-       (STE) fake-quantization to MLP fc/proj weights clamped to [-8, 7] (int4).
-       The model adapts its weights to the coarser grid during training, so
-       post-training int4 quantization inflicts less accuracy damage.
-       Int4 MLP compresses ~2.4x vs int5's ~1.88x under zstd-22, saving ~800 KB.
-       That freed budget funds an 11th transformer layer (+0.002–0.004 BPB).
-
-Architecture (builds on PR #180 SOTA):
-  - 11 layers, 512 dim, 8 heads, 4 KV heads (GQA)
-  - MLP 3x expansion (hidden=1536), relu^2 activation
-  - SmearGate + BigramHash(10240, dim=128) + TrigramHash(2048, dim=48)
-  - Orthogonal init with muP-scaled output projections
-  - U-Net skip connections, tied embeddings
-  - Int4 QAT on MLP, Int6 on attention, FP16 on embeddings
-
-Training:
-  - Muon: matrix_lr=0.02, WD=0.04, momentum=0.99
-  - AdamW for embeddings/scalars: WD=0.04
-  - warmdown=3000 iters, warmup=20 steps
-  - seq_len=2048, batch=786K tokens
-  - grad_clip=0.3
-  - EMA-SWA: alpha=0.9, start_frac=0.4, every=50 steps
-  - Int4 QAT activates at SWA start fraction
-
-Hard stop: train_gpt.py must stay ≤ 1500 lines.
-"""
 
 from __future__ import annotations
 
@@ -73,11 +27,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HYPERPARAMETERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Hyperparameters:
     data_path       = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -128,31 +77,18 @@ class Hyperparameters:
     eval_stride     = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
-    # BigramHash: hash pairs of consecutive tokens into a small embedding table.
     bigram_vocab_size   = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim          = int(os.environ.get("BIGRAM_DIM", 128))
 
-    # TrigramHash: hash triplets of consecutive tokens. Captures richer patterns
-    # (e.g. "New York City") that bigrams cannot distinguish individually.
-    # Small table (2048) and dim (48) ensure budget overhead < 100 KB compressed.
     trigram_vocab_size  = int(os.environ.get("TRIGRAM_VOCAB_SIZE", 2048))
     trigram_dim         = int(os.environ.get("TRIGRAM_DIM", 48))
 
-    # EMA-SWA: exponential moving average over checkpoints during warmdown.
-    # alpha=0.9 weights recent checkpoints ~10x more than checkpoints 23 steps ago.
     swa_enabled     = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac  = float(os.environ.get("SWA_START_FRAC", 0.4))
     swa_every       = int(os.environ.get("SWA_EVERY", 50))
     swa_ema_alpha   = float(os.environ.get("SWA_EMA_ALPHA", 0.9))  # NEW: EMA decay
 
-    # Int4 QAT: apply fake-quantization to MLP weights starting at SWA window.
-    # Trains the model to be robust to int4 compression before it's applied.
     qat_enabled     = bool(int(os.environ.get("QAT_ENABLED", "1")))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MUON OPTIMIZER (from modded-nanogpt, see THIRD_PARTY_NOTICES.md)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     """Orthogonalize a 2D update matrix via Newton-Schulz iteration."""
@@ -167,7 +103,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
-
 
 class Muon(torch.optim.Optimizer):
     """Muon optimizer: orthogonalized SGD for matrix parameters.
@@ -243,11 +178,6 @@ class Muon(torch.optim.Optimizer):
                 curr += p.numel()
         return loss
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# INT4 QUANTIZATION-AWARE TRAINING (NOVEL)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def fake_quantize_int4_ste(x: Tensor) -> Tensor:
     """Apply fake int4 quantization with Straight-Through Estimator.
 
@@ -260,16 +190,12 @@ def fake_quantize_int4_ste(x: Tensor) -> Tensor:
     int5's ~1.88x, freeing ~800 KB to fund an 11th transformer layer.
     """
     if not x.requires_grad and not torch.is_grad_enabled():
-        # Inference path: hard quantize (no STE needed)
         scale = x.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 7.0
         return (torch.clamp(torch.round(x.float() / scale), -8, 7) * scale).to(x.dtype)
-    # Training path: STE
     x_f = x.float()
     scale = x_f.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 7.0
     x_q   = torch.clamp(torch.round(x_f / scale), -8, 7) * scale
-    # STE: x_q in forward, x gradient in backward
     return (x_q.to(x.dtype) - x.detach()) + x
-
 
 class QATLinear(nn.Linear):
     """Linear layer that optionally fake-quantizes weights to int4 range.
@@ -290,11 +216,6 @@ class QATLinear(nn.Linear):
             w = w.to(x.dtype)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TOKENIZER-AGNOSTIC BPB EVALUATION
-# ─────────────────────────────────────────────────────────────────────────────
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -322,7 +243,6 @@ def build_sentencepiece_luts(
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
 
-
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
@@ -332,7 +252,6 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if usable <= 0:
         raise ValueError(f"Validation split too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
-
 
 def eval_val_sliding(
     args: Hyperparameters,
@@ -422,18 +341,12 @@ def eval_val_sliding(
     base_model.train()
     return val_loss, bits_per_token * tokens_per_byte
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# QUANTIZATION — MIXED INT4/INT6 FOR COMPRESSION
-# ─────────────────────────────────────────────────────────────────────────────
-
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     p for p in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
         "attn_scale,mlp_scale,resid_mix,q_gain,skip_weight,smear,bigram.scale,trigram.scale",
     ).split(",") if p
 )
-# Keep embeddings and the last layer's key projection in fp16 for accuracy
 FP16_KEEP_NAME_PATTERNS = tuple(
     p for p in os.environ.get(
         "FP16_KEEP_NAME_PATTERNS", "tok_emb,blocks.9.attn.c_k,blocks.10.attn.c_k"
@@ -443,10 +356,8 @@ FP16_KEEP_NAME_PATTERNS = tuple(
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q          = INT8_CLIP_PERCENTILE / 100.0
 
-
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
-
 
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
@@ -458,7 +369,6 @@ def _classify_param(name: str) -> str:
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
         return "attn"
     return "other"
-
 
 def quantize_intN_per_row(t: Tensor, clip_range: int) -> tuple[Tensor, Tensor]:
     """Quantize a float tensor to [-clip_range-1, clip_range] with per-row scale."""
@@ -477,7 +387,6 @@ def quantize_intN_per_row(t: Tensor, clip_range: int) -> tuple[Tensor, Tensor]:
     ).to(torch.int8)
     return q, scale
 
-
 def quantize_int8_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -495,7 +404,6 @@ def quantize_int8_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
         torch.clamp(t32, -clip_abs, clip_abs) / scale
     ), -127, 127).to(torch.int8)
     return q, scale
-
 
 def mixed_quantize(state_dict: dict[str, Tensor]) -> tuple[dict[str, Tensor], dict]:
     """Mixed quantization:
@@ -528,13 +436,11 @@ def mixed_quantize(state_dict: dict[str, Tensor]) -> tuple[dict[str, Tensor], di
             continue
 
         if cat == "mlp":
-            # Int4: 16 distinct values per row → best zstd ratio
             q, s = quantize_intN_per_row(t, clip_range=7)
             result[name + ".q"]     = q
             result[name + ".scale"] = s
             meta[name]              = {"type": "int4"}
         elif cat == "attn":
-            # Int6: 64 distinct values per row → good quality/size tradeoff
             q, s = quantize_intN_per_row(t, clip_range=31)
             result[name + ".q"]     = q
             result[name + ".scale"] = s
@@ -546,7 +452,6 @@ def mixed_quantize(state_dict: dict[str, Tensor]) -> tuple[dict[str, Tensor], di
             meta[name]              = {"type": "int8"}
 
     return result, meta
-
 
 def dequantize_mixed(
     result: dict[str, Tensor],
@@ -570,7 +475,6 @@ def dequantize_mixed(
             out[name] = (q.float() * float(s.item())).to(orig_dtype)
     return out
 
-
 def compress_state_dict(sd_flat: dict[str, Tensor]) -> bytes:
     """Serialize and compress a flat state dict (int8 + scale tensors) to bytes."""
     buf = io.BytesIO()
@@ -581,7 +485,6 @@ def compress_state_dict(sd_flat: dict[str, Tensor]) -> bytes:
         return cctx.compress(raw)
     return zlib.compress(raw, level=9)
 
-
 def decompress_state_dict(data: bytes) -> dict[str, Tensor]:
     if _COMPRESSOR == "zstd":
         dctx = zstd.ZstdDecompressor()
@@ -589,11 +492,6 @@ def decompress_state_dict(data: bytes) -> dict[str, Tensor]:
     else:
         raw = zlib.decompress(data)
     return torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DATA LOADING
-# ─────────────────────────────────────────────────────────────────────────────
 
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
@@ -609,7 +507,6 @@ def load_data_shard(file: Path) -> Tensor:
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
-
 
 class TokenStream:
     def __init__(self, pattern: str):
@@ -639,7 +536,6 @@ class TokenStream:
             remaining     -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
-
 class DistributedTokenLoader:
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank       = rank
@@ -657,11 +553,6 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TRANSFORMER MODULES
-# ─────────────────────────────────────────────────────────────────────────────
-
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
         super().__init__()
@@ -670,13 +561,11 @@ class RMSNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
-
 class CastedLinear(nn.Linear):
     """Weight stored in fp32; cast to input dtype at matmul time for bf16 compute."""
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
-
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
@@ -686,7 +575,6 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 or any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS)
             ) and param.dtype != torch.float32:
                 param.data = param.data.float()
-
 
 class Rotary(nn.Module):
     """RoPE (Rotary Position Embedding) with cached cos/sin tables."""
@@ -708,12 +596,10 @@ class Rotary(nn.Module):
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
-
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-
 
 class CausalSelfAttention(nn.Module):
     def __init__(
@@ -748,7 +634,6 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        # GQA: expand KV heads to match Q heads (works on all PyTorch versions)
         if self.num_kv_heads != self.num_heads:
             groups = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(groups, dim=1)
@@ -756,7 +641,6 @@ class CausalSelfAttention(nn.Module):
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
-
 
 class MLP(nn.Module):
     """relu² MLP. Uses QATLinear for MLP weights (int4 fake-quant during warmdown)."""
@@ -770,7 +654,6 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
-
 
 class SmearGate(nn.Module):
     """Blends each token's embedding with the previous token's via a learned gate.
@@ -786,7 +669,6 @@ class SmearGate(nn.Module):
         g      = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
         x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
         return (1 - g) * x + g * x_prev
-
 
 class BigramHashEmbedding(nn.Module):
     """Hash pairs of consecutive tokens into a learned embedding table.
@@ -819,7 +701,6 @@ class BigramHashEmbedding(nn.Module):
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
 
-
 class TrigramHashEmbedding(nn.Module):
     """Hash triplets of consecutive tokens into a learned embedding table. (NEW)
 
@@ -848,10 +729,8 @@ class TrigramHashEmbedding(nn.Module):
     def _hash(self, tokens: Tensor) -> Tensor:
         t   = tokens.to(torch.int32)
         mod = self.vocab_size - 1
-        # Padding: first two positions lack full context
         out = torch.full_like(t, mod)
         if tokens.size(-1) > 2:
-            # Polynomial hash with distinct prime multipliers per position
             out[..., 2:] = (
                 17911 * t[..., :-2]
                 + 36313 * t[..., 1:-1]
@@ -864,7 +743,6 @@ class TrigramHashEmbedding(nn.Module):
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
-
 
 class Block(nn.Module):
     """Transformer block with learned residual mixing and U-Net skip connections."""
@@ -887,7 +765,6 @@ class Block(nn.Module):
         x   = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
         x   = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
-
 
 class GPT(nn.Module):
     """GPT language model with BigramHash + TrigramHash input features and U-Net skip connections."""
@@ -916,11 +793,9 @@ class GPT(nn.Module):
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram  = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
-        # TrigramHash: novel addition — zero-initialized so it only activates when beneficial
         self.trigram = TrigramHashEmbedding(trigram_vocab_size, trigram_dim, model_dim) if trigram_vocab_size > 0 else None
         self.smear   = SmearGate(model_dim)
 
-        # U-Net: first half of layers = encoder, second half = decoder with skip connections
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights   = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -996,11 +871,6 @@ class GPT(nn.Module):
             if isinstance(module, QATLinear):
                 module.qat_active = active
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EMA-SWA: EXPONENTIAL MOVING AVERAGE STOCHASTIC WEIGHT AVERAGING
-# ─────────────────────────────────────────────────────────────────────────────
-
 class EMASWA:
     """Exponential Moving Average variant of Stochastic Weight Averaging.
 
@@ -1041,11 +911,6 @@ class EMASWA:
     @property
     def n_updates(self) -> int:
         return self._n_updates
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN TRAINING LOOP
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     global zeropower_via_newtonschulz5
@@ -1123,7 +988,6 @@ def main() -> None:
     )
     log0(f"train_shards:{actual_train_files} val_tokens:{val_tokens.numel() - 1}")
 
-    # ── MODEL ────────────────────────────────────────────────────────────────
     base_model = GPT(
         vocab_size           = args.vocab_size,
         num_layers           = args.num_layers,
@@ -1153,7 +1017,6 @@ def main() -> None:
         if distributed else compiled_model
     )
 
-    # ── OPTIMIZERS ───────────────────────────────────────────────────────────
     block_named = list(base_model.blocks.named_parameters())
     matrix_params = [
         p for name, p in block_named
@@ -1213,7 +1076,6 @@ def main() -> None:
     log0(f"bigram_vocab:{args.bigram_vocab_size}  trigram_vocab:{args.trigram_vocab_size}")
     log0(f"world_size:{world_size}  grad_accum_steps:{grad_accum_steps}  seed:{args.seed}")
 
-    # ── DATA ─────────────────────────────────────────────────────────────────
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
@@ -1235,7 +1097,6 @@ def main() -> None:
         remaining   = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining / max(warmdown_ms, 1e-9) if remaining <= warmdown_ms else 1.0
 
-    # Warmup: use a clean initial state for learning-rate calibration
     if args.warmup_steps > 0:
         init_model_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
         init_opt_states  = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1256,11 +1117,9 @@ def main() -> None:
             opt.load_state_dict(st)
         log0("Warmup complete.")
 
-    # ── EMA-SWA STATE ─────────────────────────────────────────────────────────
     ema_swa = EMASWA(base_model, alpha=args.swa_ema_alpha) if args.swa_enabled else None
     swa_active = False
 
-    # ── MAIN TRAINING ─────────────────────────────────────────────────────────
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     model.train()
     t0           = time.perf_counter()
@@ -1273,7 +1132,6 @@ def main() -> None:
             log0(f"Wallclock cap reached at step {step}. Stopping.")
             break
 
-        # Muon momentum warmup
         muon_mom = (
             args.muon_momentum_warmup_start
             + (args.muon_momentum - args.muon_momentum_warmup_start)
@@ -1287,7 +1145,6 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * mul
 
-        # Determine if we are in the SWA / QAT window
         in_swa_window = (mul < 1.0 and (1.0 - mul) >= (1.0 - args.swa_start_frac))
         if in_swa_window and not swa_active:
             swa_active = True
@@ -1316,7 +1173,6 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
 
-        # EMA-SWA collection
         if swa_active and ema_swa is not None and step % args.swa_every == 0:
             ema_swa.update(base_model)
 
@@ -1331,7 +1187,6 @@ def main() -> None:
 
         if step % args.val_loss_every == 0 or step == args.iterations:
             if ema_swa is not None and ema_swa.n_updates > 0:
-                # Evaluate on the EMA-averaged model for a stable estimate
                 _saved_sd = {k: v.clone() for k, v in base_model.state_dict().items()}
                 ema_swa.load_into(base_model)
             vl, vbpb = eval_val_sliding(
@@ -1344,14 +1199,12 @@ def main() -> None:
             if ema_swa is not None and ema_swa.n_updates > 0:
                 base_model.load_state_dict(_saved_sd)
 
-    # ── FINAL MODEL EXPORT ────────────────────────────────────────────────────
     if ema_swa is not None and ema_swa.n_updates > 0:
         ema_swa.load_into(base_model)
         log0(f"EMA-SWA loaded ({ema_swa.n_updates} checkpoints, alpha={ema_swa.alpha}).")
     else:
         log0("No EMA-SWA checkpoints collected. Using final training weights.")
 
-    # Disable QAT before export (weights are already adapted)
     base_model.set_mlp_qat(False)
 
     template_sd = {k: v.clone() for k, v in base_model.state_dict().items()}
@@ -1363,7 +1216,6 @@ def main() -> None:
     log0(f"code_bytes:{code_bytes}  model_bytes:{model_bytes}  total_bytes:{total_bytes}")
     log0(f"budget_ok:{total_bytes <= 16_000_000}")
 
-    # Verify roundtrip quality
     decompressed_sd = decompress_state_dict(compressed)
     restored_sd     = dequantize_mixed(decompressed_sd, meta, template_sd)
     base_model.load_state_dict(restored_sd, strict=True)
@@ -1376,7 +1228,6 @@ def main() -> None:
 
     if distributed:
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()
